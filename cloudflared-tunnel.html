@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Cloudflare Tunnels 심화 원리 (NAT & Keep-Alive)</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: #f0f2f5; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .board { position: relative; width: 950px; height: 500px; background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px; overflow: hidden; display: flex; }
+        
+        /* 3개의 구역(Zone) */
+        .zone { position: relative; border-right: 2px dashed #ddd; display: flex; flex-direction: column; align-items: center; padding-top: 20px; }
+        .zone:last-child { border-right: none; }
+        .zone-title { font-size: 15px; font-weight: bold; color: #555; background: #eee; padding: 5px 15px; border-radius: 20px; z-index: 2; }
+        
+        /* 노드(장비) 스타일 */
+        .node { position: absolute; padding: 15px; border-radius: 8px; text-align: center; font-weight: bold; font-size: 13px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); z-index: 10; line-height: 1.5; }
+        
+        #user { left: 30px; top: 220px; background: #ffebee; border: 2px solid #ef5350; width: 120px; }
+        #cloudflare { left: 260px; top: 220px; background: #e3f2fd; border: 2px solid #42a5f5; width: 150px; }
+        
+        /* NAT 장비 및 세션 테이블 */
+        #nat { left: 510px; top: 120px; background: #eceff1; border: 2px solid #90a4ae; width: 100px; height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 14px; color: #37474f; z-index: 5; }
+        #session-table { position: absolute; left: 450px; top: 40px; background: #333; color: #00ff00; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 6px; width: 220px; z-index: 15; opacity: 0.3; transition: all 0.3s; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+        .table-title { color: #fff; border-bottom: 1px dashed #777; padding-bottom: 5px; margin-bottom: 5px; font-weight: bold; text-align: center; }
+        
+        #server { left: 760px; top: 220px; background: #e8f5e9; border: 2px solid #66bb6a; width: 140px; }
+        
+        /* 지속되는 터널 (파이프라인) */
+        #tunnel-pipe { position: absolute; left: 360px; top: 242px; width: 0px; height: 16px; background: linear-gradient(90deg, #42a5f5, #66bb6a); border-radius: 8px; z-index: 1; transition: width 1s ease-in-out; opacity: 0.3; }
+        
+        /* 애니메이션용 패킷 */
+        .packet { position: absolute; width: 30px; height: 20px; border-radius: 6px; background: #66bb6a; color: white; font-size: 10px; font-weight: bold; display: none; align-items: center; justify-content: center; z-index: 20; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        .ping-packet { width: 16px; height: 16px; border-radius: 50%; background: #ffeb3b; border: 2px solid #fbc02d; color: transparent; }
+        
+        /* 컨트롤 패널 */
+        .controls { display: flex; gap: 10px; margin-bottom: 10px; }
+        button { padding: 10px 15px; font-size: 14px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; color: white; }
+        .btn-step1 { background-color: #42a5f5; } .btn-step1:hover { background-color: #1e88e5; }
+        .btn-step2 { background-color: #fbc02d; color: #333; } .btn-step2:hover { background-color: #f9a825; }
+        .btn-step3 { background-color: #ef5350; } .btn-step3:hover { background-color: #e53935; }
+        
+        /* 로그 메시지 */
+        #log { margin-top: 5px; font-size: 16px; font-weight: bold; color: #333; height: 30px; }
+        
+        /* 상태 텍스트 애니메이션 */
+        .flash { animation: flash-text 0.5s; }
+        @keyframes flash-text { 0% { color: #fff; transform: scale(1.1); } 100% { color: #00ff00; transform: scale(1); } }
+    </style>
+</head>
+<body>
+
+    <h2>🧠 Cloudflare Tunnels 심화 원리 (NAT Session & Keep-Alive)</h2>
+    
+    <div class="controls">
+        <button class="btn-step1" onclick="step1_outbound()" id="btn1">1단계: Outbound 연결 및 NAT 테이블 기록</button>
+        <button class="btn-step2" onclick="step2_keepalive()" id="btn2" disabled>2단계: Keep-Alive (수화기 들고있기)</button>
+        <button class="btn-step3" onclick="step3_reverse()" id="btn3" disabled>3단계: 외부 요청 수신 (터널 재사용)</button>
+    </div>
+    <div id="log">1단계를 눌러 서버에서 외부로 첫 연결을 시작하세요.</div>
+
+    <div class="board" id="board">
+        <div class="zone" style="flex: 1"><div class="zone-title">인터넷 (외부)</div></div>
+        <div class="zone" style="flex: 1.2"><div class="zone-title">Cloudflare망</div></div>
+        <div class="zone" style="flex: 1.5; border-right: none;"><div class="zone-title">사내망 (On-Premise)</div></div>
+
+        <!-- 영구 터널 파이프 -->
+        <div id="tunnel-pipe"></div>
+
+        <div id="user" class="node">외부 사용자<br>(웹 브라우저)</div>
+        <div id="cloudflare" class="node">Cloudflare Edge<br><span style="font-size:11px; color:#1e88e5;">(Multiplexing 대기)</span></div>
+        
+        <!-- NAT 세션 테이블 모니터 -->
+        <div id="session-table">
+            <div class="table-title">NAT Session Table</div>
+            <div id="session-row" style="opacity: 0;">
+                [ID: 172.16.x.x -> CF]<br>
+                상태: <span id="sess-state">ESTABLISHED</span><br>
+                수명: <span id="sess-ttl">60s</span> (만료시 닫힘)
+            </div>
+            <div id="session-empty" style="text-align:center; margin-top:10px; color:#888;">[ 비어있음 ]</div>
+        </div>
+
+        <div id="nat" class="node">
+            <b>NAT 라우터<br>(방화벽)</b>
+        </div>
+        
+        <div id="server" class="node">사내 서버<br>(cloudflared)<br><span style="font-size:11px; color:#388e3c;">172.16.8.10</span></div>
+        
+        <div id="packet" class="packet">SYN</div>
+    </div>
+
+    <script>
+        const packet = document.getElementById('packet');
+        const log = document.getElementById('log');
+        const tunnelPipe = document.getElementById('tunnel-pipe');
+        const sessRow = document.getElementById('session-row');
+        const sessEmpty = document.getElementById('session-empty');
+        const sessTtl = document.getElementById('sess-ttl');
+        const sessionBox = document.getElementById('session-table');
+        
+        let tunnelEstablished = false;
+        let isAnimating = false;
+        let timerInterval;
+        let timeLeft = 60;
+
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        // 1. 아웃바운드 연결 (NAT 테이블 갱신)
+        async function step1_outbound() {
+            if(isAnimating || tunnelEstablished) return;
+            isAnimating = true;
+            
+            packet.className = 'packet';
+            packet.innerText = 'SYN';
+            packet.style.backgroundColor = '#66bb6a';
+            packet.style.display = 'flex';
+            packet.style.transition = 'all 0.6s linear';
+            
+            log.style.color = "#333";
+            log.innerText = "1. 사내 서버가 Cloudflare로 먼저(Outbound) 통신을 시도합니다.";
+            
+            // 서버 -> NAT 이동
+            packet.style.left = '760px'; packet.style.top = '240px'; 
+            await sleep(50);
+            packet.style.left = '610px'; packet.style.top = '240px'; 
+            await sleep(600);
+            
+            // NAT 도착, 테이블 갱신
+            log.innerText = "2. NAT 라우터가 아웃바운드를 허용하고 [세션 테이블]에 기록을 남깁니다.";
+            sessionBox.style.opacity = '1';
+            sessEmpty.style.display = 'none';
+            sessRow.style.opacity = '1';
+            await sleep(1000);
+            
+            // NAT -> CF 이동
+            packet.style.left = '360px'; packet.style.top = '240px'; 
+            await sleep(600);
+            
+            // 터널 파이프 생성
+            tunnelPipe.style.width = '420px'; // CF부터 Server 앞까지
+            tunnelEstablished = true;
+            log.style.color = "#2e7d32";
+            log.innerText = "✅ 통로(파이프)가 뚫렸습니다! 이제 NAT는 이 통로의 양방향 데이터를 허용합니다.";
+            
+            // 타이머 시작
+            startTimer();
+            
+            await sleep(1000);
+            packet.style.display = 'none';
+            document.getElementById('btn1').disabled = true;
+            document.getElementById('btn1').style.backgroundColor = '#757575';
+            document.getElementById('btn2').disabled = false;
+            document.getElementById('btn3').disabled = false;
+            isAnimating = false;
+        }
+
+        // 2. Keep-Alive 통신
+        async function step2_keepalive() {
+            if(isAnimating || !tunnelEstablished) return;
+            isAnimating = true;
+            
+            packet.className = 'packet ping-packet';
+            packet.innerText = '';
+            packet.style.display = 'flex';
+            packet.style.transition = 'all 0.4s linear';
+            
+            log.style.color = "#f57f17";
+            log.innerText = "1. cloudflared가 지속적으로 [Keep-Alive Ping]을 보냅니다.";
+            
+            // Ping (서버 -> CF)
+            packet.style.left = '760px'; packet.style.top = '244px'; 
+            await sleep(50);
+            packet.style.left = '380px'; packet.style.top = '244px'; 
+            
+            // NAT 통과할 때 TTL 리셋
+            setTimeout(() => {
+                timeLeft = 60;
+                sessTtl.innerText = "60s";
+                sessTtl.classList.remove('flash');
+                void sessTtl.offsetWidth; // trigger reflow
+                sessTtl.classList.add('flash');
+            }, 200);
+            
+            await sleep(500);
+            
+            log.innerText = "2. 패킷이 오가는 것을 본 NAT 라우터가 세션 수명(TTL)을 다시 60초로 연장합니다!";
+            
+            // Pong (CF -> 서버)
+            packet.style.left = '760px'; packet.style.top = '244px'; 
+            await sleep(500);
+            
+            packet.style.display = 'none';
+            isAnimating = false;
+        }
+
+        // 3. 역방향 트래픽 수신
+        async function step3_reverse() {
+            if(isAnimating || !tunnelEstablished) return;
+            isAnimating = true;
+            
+            packet.className = 'packet';
+            packet.innerText = 'HTTP';
+            packet.style.backgroundColor = '#ef5350';
+            packet.style.display = 'flex';
+            packet.style.transition = 'all 0.6s ease-in-out';
+            
+            log.style.color = "#333";
+            log.innerText = "1. 외부 사용자가 Cloudflare 엣지로 접속을 요청합니다.";
+            
+            // User -> CF
+            packet.style.left = '100px'; packet.style.top = '240px'; 
+            await sleep(50);
+            packet.style.left = '260px'; packet.style.top = '240px'; 
+            await sleep(800);
+            
+            log.innerText = "2. CF가 뚫려있는 파이프(터널) 안으로 외부 트래픽을 밀어 넣습니다.";
+            packet.style.left = '510px'; packet.style.top = '240px'; // NAT 앞 도착
+            await sleep(600);
+            
+            log.style.color = "#2e7d32";
+            log.innerText = "3. NAT: '아, 세션 테이블에 등록된 합법적인 파이프군. 통과!'";
+            
+            // NAT 통과 표시 (녹색 박스 깜빡임)
+            sessionBox.style.boxShadow = "0 0 15px #00ff00";
+            setTimeout(() => sessionBox.style.boxShadow = "0 4px 8px rgba(0,0,0,0.3)", 500);
+            
+            packet.style.left = '760px'; packet.style.top = '240px'; 
+            await sleep(800);
+            
+            log.innerText = "✅ 방화벽 우회 꼼수가 아니라, 정당한 NAT 트래킹 원리로 서버에 도달했습니다!";
+            packet.style.backgroundColor = '#66bb6a';
+            packet.innerText = 'OK';
+            
+            await sleep(2000);
+            packet.style.display = 'none';
+            isAnimating = false;
+        }
+
+        // 세션 테이블 타이머
+        function startTimer() {
+            timerInterval = setInterval(() => {
+                if(timeLeft > 0) {
+                    timeLeft--;
+                    sessTtl.innerText = timeLeft + "s";
+                    if(timeLeft <= 10) sessTtl.style.color = "#ff5252";
+                    else sessTtl.style.color = "#00ff00";
+                }
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
