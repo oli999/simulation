@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Cloudflare Tunnels 시뮬레이터 (리뉴얼)</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: #f0f2f5; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .board { position: relative; width: 950px; height: 450px; background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px; overflow: hidden; display: flex; }
+        
+        /* 3개의 구역(Zone) */
+        .zone { position: relative; border-right: 2px dashed #ddd; display: flex; flex-direction: column; align-items: center; padding-top: 20px; }
+        .zone:last-child { border-right: none; }
+        .zone-title { font-size: 16px; font-weight: bold; color: #555; background: #eee; padding: 5px 15px; border-radius: 20px; z-index: 2; }
+        
+        /* 노드(장비) 스타일 */
+        .node { position: absolute; padding: 15px; border-radius: 8px; text-align: center; font-weight: bold; font-size: 13px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); z-index: 10; transition: all 0.3s; line-height: 1.5; }
+        
+        #user { left: 40px; top: 200px; background: #ffebee; border: 2px solid #ef5350; width: 130px; }
+        #cloudflare { left: 280px; top: 200px; background: #e3f2fd; border: 2px solid #42a5f5; width: 140px; }
+        
+        /* 문제의 방화벽 박스: 가로 텍스트로 깔끔하게 수정 */
+        #nat { left: 520px; top: 80px; background: #fff3e0; border: 2px dashed #ff9800; width: 100px; height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 15px; color: #d84315; z-index: 5; }
+        
+        #server { left: 750px; top: 200px; background: #e8f5e9; border: 2px solid #66bb6a; width: 140px; }
+        
+        /* 터널 선 (서버에서 CF로 뻗어나가는 초록색 아치형 선) */
+        #tunnel-line { position: absolute; width: 100%; height: 100%; pointer-events: none; z-index: 1; opacity: 0; transition: opacity 0.5s; top:0; left:0;}
+        
+        /* 애니메이션용 패킷 */
+        .packet { position: absolute; width: 36px; height: 24px; border-radius: 12px; background: #ef5350; color: white; font-size: 11px; font-weight: bold; display: none; align-items: center; justify-content: center; z-index: 20; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        
+        /* 컨트롤 패널 */
+        .controls { display: flex; gap: 15px; margin-bottom: 10px; }
+        button { padding: 12px 20px; font-size: 15px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; color: white; }
+        .btn-action { background-color: #42a5f5; }
+        .btn-action:hover { background-color: #1e88e5; }
+        .btn-ping { background-color: #ef5350; font-size: 16px; }
+        .btn-ping:hover { background-color: #e53935; }
+        
+        /* 로그 메시지 */
+        #log { margin-top: 10px; font-size: 18px; font-weight: bold; color: #333; height: 30px; }
+    </style>
+</head>
+<body>
+
+    <h2>🛡️ Cloudflare Tunnels (역방향 터널) 시뮬레이터</h2>
+    
+    <div class="controls">
+        <button class="btn-action" onclick="toggleTunnel()" id="tunnelBtn">1단계: 서버에서 밖으로 역방향 터널 열기</button>
+        <button class="btn-ping" onclick="sendRequest()">▶ 2단계: 외부에서 사내 서버로 접속 시도</button>
+    </div>
+    <div id="log">버튼을 눌러 시뮬레이션을 시작하세요.</div>
+
+    <div class="board" id="board">
+        <!-- 터널 SVG -->
+        <svg id="tunnel-line">
+            <!-- 서버(835)에서 방화벽 위를 넘어 CF(365)로 향하는 경로 -->
+            <path d="M 835 200 Q 600 -30 365 200" fill="transparent" stroke="#66bb6a" stroke-width="5" stroke-dasharray="15,10" stroke-linecap="round">
+                <animate attributeName="stroke-dashoffset" from="50" to="0" dur="1s" repeatCount="indefinite" />
+            </path>
+        </svg>
+
+        <div class="zone" style="flex: 0.9"><div class="zone-title">인터넷 (외부)</div></div>
+        <div class="zone" style="flex: 1.1"><div class="zone-title">Cloudflare 엣지망</div></div>
+        <div class="zone" style="flex: 1.5; border-right: none;"><div class="zone-title">사내망 (On-Premise)</div></div>
+
+        <div id="user" class="node">외부 사용자<br>(스마트폰 / 웹)</div>
+        <div id="cloudflare" class="node">Cloudflare Edge<br>(cloud-study.site)</div>
+        
+        <div id="nat" class="node">
+            <b>공유기<br>및<br>방화벽</b><br><br>
+            <span style="font-size:12px; background:#ffcc80; padding:4px 6px; border-radius:4px; line-height:1.2;">외부 접근<br>원천 차단<br>(Inbound)</span>
+        </div>
+        
+        <div id="server" class="node">사내 서버<br>(VMware 80포트)<br><span style="font-size:11px; color:#388e3c; background:#e8f5e9; padding:2px; border-radius:3px;">cloudflared 데몬</span></div>
+        
+        <div id="packet" class="packet">요청</div>
+    </div>
+
+    <script>
+        let isTunnelOpen = false;
+        let isAnimating = false;
+        
+        const packet = document.getElementById('packet');
+        const tunnelLine = document.getElementById('tunnel-line');
+        const log = document.getElementById('log');
+
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        function toggleTunnel() {
+            if(isAnimating) return;
+            isTunnelOpen = !isTunnelOpen;
+            tunnelLine.style.opacity = isTunnelOpen ? "1" : "0";
+            document.getElementById('tunnelBtn').innerText = isTunnelOpen ? "터널 닫기" : "1단계: 서버에서 밖으로 역방향 터널 열기";
+            document.getElementById('tunnelBtn').style.backgroundColor = isTunnelOpen ? "#757575" : "#42a5f5";
+            
+            if(isTunnelOpen) {
+                log.style.color = "#2e7d32";
+                log.innerText = "✅ 사내 서버에서 밖으로(Outbound) 역방향 터널이 뚫렸습니다!";
+            } else {
+                log.style.color = "#333";
+                log.innerText = "터널이 해제되었습니다.";
+            }
+        }
+
+        async function sendRequest() {
+            if(isAnimating) return;
+            isAnimating = true;
+            
+            packet.style.transition = 'all 0.8s ease-in-out';
+            packet.style.display = 'flex';
+            packet.innerText = 'HTTP';
+            packet.style.backgroundColor = '#ef5350';
+            
+            // 1. 사용자 -> Cloudflare
+            log.style.color = "#333";
+            log.innerText = "1. 외부 사용자가 도메인(cloud-study.site)으로 접속을 요청합니다.";
+            packet.style.left = '120px'; packet.style.top = '218px'; // 출발점
+            await sleep(50);
+            packet.style.left = '250px'; packet.style.top = '218px'; // CF 도착
+            await sleep(900);
+
+            if (!isTunnelOpen) {
+                // 터널 없을 때: 방화벽에 부딪히고 실패
+                log.innerText = "2. CF가 사내 서버 공인IP로 요청을 찔러봅니다...";
+                packet.style.left = '351px'; packet.style.top = '218px'; 
+                await sleep(50);
+                packet.style.left = '490px'; packet.style.top = '218px'; // 방화벽 충돌
+                await sleep(800);
+                
+                log.style.color = "#c62828";
+                log.innerText = "❌ 실패: 사내 방화벽이 외부(Inbound) 요청을 가차없이 튕겨냅니다! (502 Error)";
+                packet.innerText = 'X';
+                packet.style.backgroundColor = '#c62828';
+                packet.style.left = '450px'; // 뒤로 튕겨남
+                await sleep(1500);
+            } else {
+                // 터널 있을 때: 아치형 경로를 따라 우회
+                log.innerText = "2. CF가 '미리 뚫려있는 역방향 터널'을 발견하고 패킷을 올려보냅니다!";
+                
+                // 자연스러운 아치형 궤도 이동
+                packet.style.transition = 'all 0.25s linear';
+                packet.style.left = '351px'; packet.style.top = '186px'; 
+                await sleep(250);
+                packet.style.left = '460px'; packet.style.top = '100px'; 
+                await sleep(250);
+                packet.style.left = '586px'; packet.style.top = '71px'; // 방화벽 넘어가는 정점
+                log.innerText = "3. 방화벽 설정 없이도, 열린 터널을 통해 방화벽을 우회(Bypass)합니다!";
+                await sleep(250);
+                packet.style.left = '710px'; packet.style.top = '100px'; 
+                await sleep(250);
+                packet.style.left = '821px'; packet.style.top = '186px'; 
+                await sleep(250);
+                
+                // 서버 안으로 쏙 들어감
+                packet.style.transition = 'all 0.4s ease-out';
+                packet.style.left = '821px'; packet.style.top = '218px'; 
+                await sleep(500);
+
+                log.style.color = "#2e7d32";
+                log.innerText = "✅ 성공: 사내망 80포트 웹서버에 안전하게 도달했습니다! (200 OK)";
+                packet.style.backgroundColor = '#66bb6a';
+                packet.innerText = 'OK';
+                await sleep(1500);
+            }
+
+            // 초기화
+            packet.style.display = 'none';
+            isAnimating = false;
+        }
+    </script>
+</body>
+</html>
