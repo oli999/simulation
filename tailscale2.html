@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Tailscale UDP Hole Punching (P2P) 시뮬레이터</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: #f0f2f5; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .board { position: relative; width: 950px; height: 500px; background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px; overflow: hidden; display: flex; }
+        
+        /* 3개의 구역(Zone) */
+        .zone { position: relative; border-right: 2px dashed #ddd; display: flex; flex-direction: column; align-items: center; padding-top: 20px; }
+        .zone:last-child { border-right: none; }
+        .zone-title { font-size: 15px; font-weight: bold; color: #555; background: #eee; padding: 5px 15px; border-radius: 20px; z-index: 2; }
+        
+        /* 노드(장비) 스타일 */
+        .node { position: absolute; padding: 15px; border-radius: 8px; text-align: center; font-weight: bold; font-size: 13px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); z-index: 10; line-height: 1.5; transition: all 0.3s; }
+        
+        #serverA { left: 30px; top: 220px; background: #e8eaed; border: 2px solid #9aa0a6; width: 100px; }
+        #natA { left: 190px; top: 120px; background: #eceff1; border: 2px solid #90a4ae; width: 60px; height: 260px; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #37474f; z-index: 5; transition: all 0.5s; }
+        
+        #coord { left: 390px; top: 70px; background: #e3f2fd; border: 2px solid #42a5f5; width: 140px; }
+        
+        #natB { left: 700px; top: 120px; background: #eceff1; border: 2px solid #90a4ae; width: 60px; height: 260px; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #37474f; z-index: 5; transition: all 0.5s; }
+        #serverB { left: 800px; top: 220px; background: #ffe0b2; border: 2px solid #fb8c00; width: 100px; }
+        
+        /* 연결선 SVG */
+        svg { position: absolute; width: 100%; height: 100%; top: 0; left: 0; pointer-events: none; z-index: 1; }
+        .line-coord { stroke: #9e9e9e; stroke-width: 2; stroke-dasharray: 5,5; opacity: 0; transition: opacity 0.5s; }
+        .line-p2p { stroke: #66bb6a; stroke-width: 6; stroke-dasharray: 15,10; opacity: 0; transition: opacity 0.5s; }
+        
+        /* 애니메이션용 패킷 */
+        .packet { position: absolute; width: 24px; height: 16px; border-radius: 4px; color: white; font-size: 10px; font-weight: bold; display: none; align-items: center; justify-content: center; z-index: 20; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        #packetA { background: #3f51b5; }
+        #packetB { background: #e65100; }
+        
+        /* 컨트롤 패널 */
+        .controls { display: flex; gap: 10px; margin-bottom: 10px; }
+        button { padding: 10px 15px; font-size: 14px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; color: white; }
+        .btn-step1 { background-color: #42a5f5; } .btn-step1:hover { background-color: #1e88e5; }
+        .btn-step2 { background-color: #fbc02d; color: #333; } .btn-step2:hover { background-color: #f9a825; }
+        .btn-step3 { background-color: #66bb6a; } .btn-step3:hover { background-color: #43a047; }
+        
+        /* 로그 메시지 */
+        #log { margin-top: 5px; font-size: 16px; font-weight: bold; color: #333; height: 30px; text-align: center; }
+        
+        /* 구멍(Hole) 이펙트 */
+        .hole-punched { border-color: #66bb6a !important; box-shadow: inset 0 0 20px #c8e6c9, 0 0 15px #81c784 !important; color: #2e7d32 !important; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h2>뚫어라 방화벽! Tailscale UDP Hole Punching 원리</h2>
+    
+    <div class="controls">
+        <button class="btn-step1" onclick="step1_exchange()" id="btn1">1단계: 중매 서버 만나기 (IP 교환)</button>
+        <button class="btn-step2" onclick="step2_punch()" id="btn2" disabled>2단계: 서로에게 UDP 패킷 쏘기 (구멍 뚫기)</button>
+        <button class="btn-step3" onclick="step3_p2p()" id="btn3" disabled>3단계: P2P 직통 터널 개통!</button>
+    </div>
+    <div id="log">1단계를 눌러 양쪽 서버가 자신의 공인 IP를 확인하게 하세요.</div>
+
+    <div class="board" id="board">
+        <svg>
+            <!-- 중매 서버 연결선 -->
+            <path id="line-coord-A" class="line-coord" d="M 80 220 Q 200 90 390 90" fill="transparent"/>
+            <path id="line-coord-B" class="line-coord" d="M 850 220 Q 700 90 530 90" fill="transparent"/>
+            <!-- P2P 직접 연결선 -->
+            <line id="line-p2p" class="line-p2p" x1="130" y1="240" x2="800" y2="240">
+                <animate attributeName="stroke-dashoffset" from="50" to="0" dur="1s" repeatCount="indefinite" />
+            </line>
+        </svg>
+
+        <div class="zone" style="flex: 1"><div class="zone-title">사내망 (A)</div></div>
+        <div class="zone" style="flex: 1.2"><div class="zone-title">인터넷 (Tailscale망)</div></div>
+        <div class="zone" style="flex: 1; border-right: none;"><div class="zone-title">AWS VPC (B)</div></div>
+
+        <div id="serverA" class="node">VMware (A)<br><span style="font-size:11px; color:#555;">사설: 172.16.8.x</span></div>
+        <div id="natA" class="node">NAT A</div>
+        
+        <div id="coord" class="node">중매 서버<br>(Coordination)<br><span style="font-size:11px; color:#1e88e5;">데이터 중계 안함</span></div>
+        
+        <div id="natB" class="node">NAT B</div>
+        <div id="serverB" class="node">EC2 (B)<br><span style="font-size:11px; color:#555;">사설: 10.0.1.x</span></div>
+        
+        <div id="packetA" class="packet">UDP</div>
+        <div id="packetB" class="packet">UDP</div>
+    </div>
+
+    <script>
+        const packetA = document.getElementById('packetA');
+        const packetB = document.getElementById('packetB');
+        const log = document.getElementById('log');
+        const natA = document.getElementById('natA');
+        const natB = document.getElementById('natB');
+        
+        let isAnimating = false;
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        // 1단계: IP 교환
+        async function step1_exchange() {
+            if(isAnimating) return;
+            isAnimating = true;
+            
+            document.getElementById('line-coord-A').style.opacity = '1';
+            document.getElementById('line-coord-B').style.opacity = '1';
+            
+            log.style.color = "#1e88e5";
+            log.innerText = "1. 양쪽 서버가 중앙 중매 서버에 접속해 서로의 [외부 공인 IP]를 알아냅니다.";
+            
+            // 패킷 A -> Coord
+            packetA.style.display = 'flex';
+            packetA.style.transition = 'all 0.5s ease-out';
+            packetA.style.left = '80px'; packetA.style.top = '220px';
+            await sleep(50);
+            packetA.style.left = '390px'; packetA.style.top = '90px';
+            
+            // 패킷 B -> Coord
+            packetB.style.display = 'flex';
+            packetB.style.transition = 'all 0.5s ease-out';
+            packetB.style.left = '850px'; packetB.style.top = '220px';
+            await sleep(50);
+            packetB.style.left = '500px'; packetB.style.top = '90px';
+            
+            await sleep(1000);
+            
+            log.innerText = "2. '서로 주소 알았지? 이제 나(중앙 서버)는 빠질 테니 둘이 알아서 연결해!'";
+            
+            await sleep(1500);
+            packetA.style.display = 'none';
+            packetB.style.display = 'none';
+            
+            document.getElementById('btn1').disabled = true;
+            document.getElementById('btn1').style.backgroundColor = '#757575';
+            document.getElementById('btn2').disabled = false;
+            isAnimating = false;
+        }
+
+        // 2단계: 홀 펀칭
+        async function step2_punch() {
+            if(isAnimating) return;
+            isAnimating = true;
+            
+            log.style.color = "#f57f17";
+            log.innerText = "1. 양쪽에서 허공을 향해 동시에 UDP 패킷을 쏩니다! (Hole Punching)";
+            
+            packetA.style.display = 'flex';
+            packetB.style.display = 'flex';
+            packetA.style.transition = 'all 0.8s linear';
+            packetB.style.transition = 'all 0.8s linear';
+            
+            // 출발
+            packetA.style.left = '130px'; packetA.style.top = '250px';
+            packetB.style.left = '800px'; packetB.style.top = '230px';
+            await sleep(50);
+            
+            // 상대방 방화벽으로 돌진
+            packetA.style.left = '690px'; packetA.style.top = '250px'; // NAT B 앞
+            packetB.style.left = '250px'; packetB.style.top = '230px'; // NAT A 앞
+            await sleep(800);
+            
+            // 첫 패킷은 방화벽에 막히거나 엇갈림, 하지만 내 방화벽엔 아웃바운드 기록이 남음
+            log.innerText = "2. 내가 패킷을 쐈기 때문에, 내 방화벽(NAT)은 상대방의 응답을 허용하는 '구멍'이 생깁니다.";
+            natA.classList.add('hole-punched');
+            natA.innerHTML = "NAT A<br>(구멍뚫림)";
+            natB.classList.add('hole-punched');
+            natB.innerHTML = "NAT B<br>(구멍뚫림)";
+            
+            packetA.innerText = "X"; packetA.style.background = "#c62828";
+            packetB.innerText = "X"; packetB.style.background = "#c62828";
+            
+            await sleep(1500);
+            
+            // 두 번째 시도: 뚫린 구멍으로 쏙 들어감
+            log.style.color = "#2e7d32";
+            log.innerText = "3. 양쪽 방화벽에 아웃바운드 규칙이 생겼으므로, 이제 서로의 패킷이 프리패스로 통과합니다!";
+            
+            packetA.innerText = "UDP"; packetA.style.background = "#3f51b5";
+            packetB.innerText = "UDP"; packetB.style.background = "#e65100";
+            
+            packetA.style.left = '800px'; // Server B 도착
+            packetB.style.left = '130px'; // Server A 도착
+            
+            await sleep(1000);
+            
+            packetA.style.display = 'none';
+            packetB.style.display = 'none';
+            
+            document.getElementById('btn2').disabled = true;
+            document.getElementById('btn2').style.backgroundColor = '#757575';
+            document.getElementById('btn3').disabled = false;
+            isAnimating = false;
+        }
+
+        // 3단계: P2P 연결 완료
+        async function step3_p2p() {
+            if(isAnimating) return;
+            isAnimating = true;
+            
+            // 중매 서버 선 없애고 P2P 선 띄우기
+            document.getElementById('line-coord-A').style.opacity = '0.2';
+            document.getElementById('line-coord-B').style.opacity = '0.2';
+            document.getElementById('line-p2p').style.opacity = '1';
+            
+            log.style.color = "#2e7d32";
+            log.innerText = "✅ 성공! 데이터가 중앙 서버를 거치지 않는 '최단 거리(P2P)' 통신이 완성되었습니다.";
+            
+            // 핑퐁 애니메이션 (P2P 통신)
+            packetA.style.display = 'flex';
+            packetA.innerText = 'Data';
+            packetA.style.background = '#66bb6a';
+            packetA.style.transition = 'all 0.6s linear';
+            
+            packetA.style.left = '130px'; packetA.style.top = '232px';
+            await sleep(50);
+            
+            // A -> B
+            packetA.style.left = '800px';
+            await sleep(600);
+            
+            // B -> A
+            packetA.style.left = '130px';
+            await sleep(600);
+            
+            packetA.style.display = 'none';
+            isAnimating = false;
+        }
+    </script>
+</body>
+</html>
